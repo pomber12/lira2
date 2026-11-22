@@ -446,7 +446,7 @@
     { id: "gold",   name: "Злато",   parts: 2, line: ["Руса за днес. Да видим дали ще ме познаеш.", "play"] },
     { id: "coffee", name: "Кафе",    parts: 3, line: ["Къса коса, топли цветове. Като сутрешно кафе.", "love"] },
     // Лира 2 – твоят модел от VRoid (възрастна). Само тя подава ръка, когато я докоснеш.
-    { id: "lira2",  name: "Лира 2",  parts: 2, adult: true, neck: 0.55, mix: { hair: "gold", iris: "gold" }, anklet: "left", line: ["Здравей. Порастнах малко, харесва ли ти?", "shy"] },
+    { id: "lira2",  name: "Лира 2",  parts: 2, adult: true, neck: 0.55, mix: { hair: "lira", iris: "gold" }, anklet: "left", line: ["Здравей. Порастнах малко, харесва ли ти?", "shy"] },
   ];
 
   let vrm = null;          // моделът, който се вижда сега
@@ -526,6 +526,30 @@
         for (const p of pieces) { all.set(new Uint8Array(p), at); at += p.byteLength; }
         return all.buffer;
       }
+    } catch {}
+    // ...после models/<id>.js (моделът, записан като текст – както в Lira.zip)
+    try {
+      window.LIRA_MODELS = window.LIRA_MODELS || {};
+      if (!window.LIRA_MODELS[look.id]) {
+        await new Promise((ok, fail) => {
+          const sc = document.createElement("script");
+          sc.src = `models/${look.id}.js`;
+          sc.onload = ok;
+          sc.onerror = fail;
+          document.body.appendChild(sc);
+        });
+      }
+      if (window.LIRA_MODELS[look.id]) {
+        loadBar.style.width = "70%";
+        const buffer = base64ToBuffer(window.LIRA_MODELS[look.id]);
+        delete window.LIRA_MODELS[look.id];
+        return buffer;
+      }
+    } catch {}
+    // ...после <id>.vrm в главната папка (напр. lira.vrm)
+    try {
+      const res = await fetch(`${look.id}.vrm`);
+      if (res.ok) return await res.arrayBuffer();
     } catch {}
     // Иначе (в Claude): моделът е разделен на текстови части
     let text = "";
@@ -638,7 +662,8 @@
 
   lookBtn.onclick = () => switchLook((lookIndex + 1) % LOOKS.length, true);
 
-  const materialName = (o) => (o.material && o.material.name) || "";
+  // името на материала (при два материала – основен и контур – взима първия)
+  const materialName = (o) => { const m = Array.isArray(o.material) ? o.material[0] : o.material; return (m && m.name) || ""; };
   function findMeshes(model, pattern) {
     const found = [];
     model.scene.traverse((o) => { if (o.isMesh && pattern.test(materialName(o))) found.push(o); });
@@ -664,7 +689,7 @@
       if (!src) return;
       const name = materialName(src);
       // ириси, кожа на лицето, очна линия, мигли и вежди – всичко обикновено, без цветни линии
-      if (name === "" || /EyeIris|EyeExtra|Eyeline|Eyelash|FaceBrow/.test(name)) mesh.material = src.material;
+      if (name === "" || /EyeIris|EyeExtra|Eyeline|Eyelash|FaceBrow|Face_00_SKIN/.test(name)) mesh.material = src.material;
     });
   }
 
@@ -753,7 +778,10 @@
     const source = findMeshes(donor, pattern);
     for (const mesh of findMeshes(model, pattern)) {
       const same = source.find((s) => materialName(s) === materialName(mesh)) || source[0];
-      if (same) mesh.material = same.material;
+      if (same) {
+        const m = same.material;
+        mesh.material = Array.isArray(m) && !Array.isArray(mesh.material) && !mesh.geometry.groups.length ? m[0] : m;
+      }
     }
   }
 
@@ -848,15 +876,87 @@
   // Слага косата на donor върху model.
   // Косата на donor се „замразява“ в покой и се закача за главата на model,
   // а собствената коса на model се скрива. (Косата така не се люлее.)
+  // Слага косата на donor върху model ЗАЕДНО с костите и физиката ѝ, за да се люлее.
+  // Костите на косата се преместват под главата на model, а физиката на donor
+  // (springBoneManager) продължава да ги движи всеки кадър.
   function transplantHair(model, donor) {
-    const isHair = (o) => o.isMesh && /Hair_00_HAIR/.test(o.material && o.material.name);
-    const isHairBack = (o) => o.isMesh && /HairBack/.test(o.material && o.material.name);
+    const springs = donor.springBoneManager;
+    if (!springs) return transplantHairStatic(model, donor);
+    const isHair = (o) => o.isMesh && /Hair_00_HAIR/.test(materialName(o));
+    const isHairBack = (o) => o.isMesh && /HairBack/.test(materialName(o));
+    const tHead = model.humanoid.getRawBoneNode("head"), dHead = donor.humanoid.getRawBoneNode("head");
+    model.scene.updateMatrixWorld(true);
+    donor.scene.updateMatrixWorld(true);
+
+    // старата коса – скрита; основата под косата взима цвета на новата
+    let donorBack = null;
+    donor.scene.traverse((o) => { if (isHairBack(o)) donorBack = Array.isArray(o.material) ? o.material[0] : o.material; });
+    model.scene.traverse((o) => {
+      if (isHair(o)) o.visible = false;
+      if (isHairBack(o) && donorBack) o.material = donorBack;
+    });
+
+    // местим donor така, че главите да съвпаднат
+    const shift = new THREE.Vector3().setFromMatrixPosition(tHead.matrixWorld)
+      .sub(new THREE.Vector3().setFromMatrixPosition(dHead.matrixWorld));
+    donor.scene.position.add(shift);
+    donor.scene.updateMatrixWorld(true);
+
+    // „заместител“ на главата на donor, закачен за главата на model
+    const proxyFor = new Map();
+    const proxy = (bone) => {
+      if (proxyFor.has(bone)) return proxyFor.get(bone);
+      const o = new THREE.Object3D();
+      bone.add(o);
+      o.updateMatrixWorld(true);
+      tHead.attach(o);
+      proxyFor.set(bone, o);
+      return o;
+    };
+    const headProxy = proxy(dHead);
+
+    // костите на косата: ставите на физиката под главата + всичко под тях
+    const under = (b, root) => { for (let x = b.parent; x; x = x.parent) if (x === root) return true; return false; };
+    const keep = [...springs.joints].filter((j) => under(j.bone, dHead));
+    const moved = new Set();
+    for (const j of keep) j.bone.traverse((x) => moved.add(x));
+    const roots = keep.map((j) => j.bone).filter((b) => !moved.has(b.parent));
+    for (const r of new Set(roots)) {
+      // местим веригата под заместителя, без да променяме локалното ѝ положение
+      // (заместителят е точно там, където е била главата на donor)
+      const parent = r.parent;
+      if (parent === dHead) headProxy.add(r);
+      else proxy(parent).add(r);
+    }
+    // ставите, които не са коса, махаме; сблъсъците с тялото на donor – също
+    for (const j of [...springs.joints]) if (!keep.includes(j)) springs.deleteJoint(j);
+    for (const j of keep) j.colliderGroups = [];
+
+    // мрежите на косата – вързани за преместените кости (останалите кости – за заместители)
+    const parts = [];
+    donor.scene.traverse((o) => { if (isHair(o) && o.isSkinnedMesh) parts.push(o); });
+    for (const src of parts) {
+      const bones = src.skeleton.bones.map((b) => (moved.has(b) ? b : proxy(b)));
+      const mesh = new THREE.SkinnedMesh(src.geometry, src.material);
+      mesh.frustumCulled = false;
+      mesh.renderOrder = src.renderOrder;
+      model.scene.add(mesh);
+      mesh.bind(new THREE.Skeleton(bones, src.skeleton.boneInverses.map((m) => m.clone())), src.bindMatrix.clone());
+    }
+    springs.setInitState();
+    (model.scene.userData.extraSprings ||= []).push(springs);   // обновява се всеки кадър
+  }
+
+  // Старият начин (без физика) – ако donor няма физика на косата
+  function transplantHairStatic(model, donor) {
+    const isHair = (o) => o.isMesh && /Hair_00_HAIR/.test(materialName(o));
+    const isHairBack = (o) => o.isMesh && /HairBack/.test(materialName(o));
     model.scene.updateMatrixWorld(true);
     donor.scene.updateMatrixWorld(true);
 
     // Скриваме старата коса; основата под косата взима цвета на новата
     let donorBack = null;
-    donor.scene.traverse((o) => { if (isHairBack(o)) donorBack = o.material; });
+    donor.scene.traverse((o) => { if (isHairBack(o)) donorBack = Array.isArray(o.material) ? o.material[0] : o.material; });
     model.scene.traverse((o) => {
       if (isHair(o)) o.visible = false;
       if (isHairBack(o) && donorBack) o.material = donorBack;
@@ -883,6 +983,7 @@
       hair.setAttribute("position", new THREE.BufferAttribute(positions, 3));
       if (geo.attributes.uv) hair.setAttribute("uv", geo.attributes.uv);
       if (geo.index) hair.setIndex(geo.index);
+      for (const gr of geo.groups) hair.addGroup(gr.start, gr.count, gr.materialIndex);   // за два материала
       if (geo.attributes.normal) {
         const normals = geo.attributes.normal.clone();
         normals.applyNormalMatrix(new THREE.Matrix3().getNormalMatrix(src.matrixWorld));
@@ -1432,7 +1533,8 @@
 
       if (!(browseW > 0.01 && wander.activity && wander.activity.brush)) brush.visible = false;
       // Чадър: лявата ръка пред гърдите, чадърът изправен над главата
-      const umbShow = umbrellaOn && !hugOn && !danceOn && !(offerOn && offerSide === "left");
+      // в стаята не държи отворен чадър – щом излезе от нея, пак го взима
+      const umbShow = umbrellaOn && !hugOn && !danceOn && !(offerOn && offerSide === "left") && !(Room && Room.on);
       umbW = lerp(umbW, umbShow ? 1 : 0, 1 - Math.pow(0.03, dt));
       if (umbW > 0.01 && B.leftHand && free("leftUpperArm") && free("leftLowerArm")) {
         const e = umbW * umbW * (3 - 2 * umbW);
@@ -1610,6 +1712,7 @@
 
       Pose.beforeUpdate();   // ако дърпаш косата – държим я там
       vrm.update(dt); // физика на косата и очите
+      for (const m of vrm.scene.userData.extraSprings || []) m.update(dt);   // физика на пренесената коса
       Pose.drawHandles();
     }
 
